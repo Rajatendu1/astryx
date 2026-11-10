@@ -557,6 +557,20 @@ export function useTableWindow<T>({
         })
       : null;
   const isWindowed = plan !== null;
+  // A scroll area as tall as every row means the parent gives the Table no
+  // height, so windowing mounts every row.
+  const seedRowCount =
+    declared === undefined
+      ? 0
+      : Math.ceil(declared.initialViewportHeight / declared.rowHeight) + 4;
+  useDevWarningPerMessage(
+    'Table',
+    "Every row is mounted because the Table's scroll area is as tall as all of its rows. Give the Table's parent a height so windowing can bound them.",
+    plan !== null &&
+      hasCurrentMeasurement &&
+      data.length > seedRowCount &&
+      snapshot.viewportHeight + 1 >= plan.totalHeight,
+  );
   const start = plan?.start ?? 0;
   const end = plan?.end ?? data.length;
   const rowHeight = config?.rowHeight ?? 0;
