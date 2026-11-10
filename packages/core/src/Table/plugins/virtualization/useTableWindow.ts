@@ -5,7 +5,7 @@
 /**
  * @file useTableWindow.ts
  * @input Parent-admitted data/keys, parent-owned shared geometry source and DOM refs
- * @output React-tracked stable row/gap plan, one focus island and fixed-mode status
+ * @output React-tracked stable row/gap plan, one focus island and fixed-mode status; reads cells by column position beside column spacers
  * @position Table pre-cell planner; DOM refs are effect resources, with no owned observation
  */
 import {
@@ -306,7 +306,11 @@ function getGeometryViolation(
     if (height > 0 && Math.abs(height - rowHeight) > 0.75) {
       return 'Mounted row pitch does not match rowHeight.';
     }
-    for (const [columnIndex, cell] of Array.from(row.cells).entries()) {
+    for (const [domIndex, cell] of Array.from(row.cells).entries()) {
+      const columnIndex = getColumnIndex(cell, domIndex);
+      if (columnIndex === undefined) {
+        continue;
+      }
       if (
         logicalPositionColumns.has(columnIndex) &&
         hasClippedRowNumber(cell)
@@ -320,6 +324,35 @@ function getGeometryViolation(
     checkedRows.add(row);
   }
   return undefined;
+}
+
+/**
+ * The cell of a mounted row at a full-table column index. While columns
+ * window, cells carry their position and spacers stand between them.
+ */
+function getCellAtColumn(
+  row: HTMLTableRowElement,
+  columnIndex: number,
+): HTMLTableCellElement | undefined {
+  const cells = Array.from(row.cells);
+  if (!cells.some(cell => cell.hasAttribute('aria-colindex'))) {
+    return cells[columnIndex];
+  }
+  return cells.find(
+    cell => cell.getAttribute('aria-colindex') === String(columnIndex + 1),
+  );
+}
+
+/** The full-table column index of a mounted cell; spacers have none. */
+function getColumnIndex(
+  cell: HTMLTableCellElement,
+  domIndex: number,
+): number | undefined {
+  if (cell.getAttribute('aria-hidden') === 'true') {
+    return undefined;
+  }
+  const position = cell.getAttribute('aria-colindex');
+  return position == null ? domIndex : Number(position) - 1;
 }
 
 function scrollViewport(node: HTMLDivElement, scrollTop: number) {
@@ -602,10 +635,11 @@ export function useTableWindow<T>({
         state.isPositionWidthMeasured = true;
         const next = new Map<number, number>();
         for (const index of logicalPositionColumns) {
-          const cell = row.cells[index];
+          const cell = getCellAtColumn(row, index);
+          // A column windowed out keeps its last measured width.
           const width =
             cell == null
-              ? undefined
+              ? positionWidths.get(index)
               : measureLogicalPositionWidth(cell, String(data.length));
           if (width !== undefined) {
             next.set(index, width);
