@@ -4,16 +4,32 @@
 
 /**
  * @file useTableColumnWindow.ts
- * @input Admitted column pitches, pinned run sizes, the seed and shared inline geometry
- * @output Stable column and spacer segments in full-table column positions
+ * @input Admitted column pitches and keys, pinned run sizes, the seed and shared inline geometry
+ * @output Stable column and spacer segments, one retained focused column and the inline anchor
  * @position Table pre-cell column planner; reads the parent's viewport, owns no observer
  */
-import {useMemo, useState, useSyncExternalStore, type RefObject} from 'react';
+import {
+  useCallback,
+  useMemo,
+  useRef,
+  useState,
+  useSyncExternalStore,
+  type FocusEvent,
+  type RefObject,
+} from 'react';
 import {useIsomorphicLayoutEffect} from '../../../hooks/useIsomorphicLayoutEffect';
 import {useDevWarningPerMessage} from '../../../hooks/useDevWarning';
 import {
+  moveFocusLeftBehind,
+  noteFocusWithin,
+  type FocusWithin,
+} from '../../../utils/focusReturn';
+import {useInteractionModalityTrackingFor} from '../../../utils/interactionModality';
+import {
   calculateVariableListRange,
+  createListWindowSegments,
   isPositiveFinite,
+  reconcileListAnchor,
 } from '../../../utils/listWindow';
 import {
   getTableVirtualizationConfig,
@@ -95,13 +111,36 @@ export interface UseTableColumnWindowOptions {
   startCount: number;
   /** Columns in the pinned end run, through the last column. */
   endCount: number;
+  /** Column keys in full-table order: focus and the anchor follow keys. */
+  columnKeys: ReadonlyArray<string>;
   table: RefObject<HTMLTableElement | null>;
+  viewport: RefObject<HTMLDivElement | null>;
   geometry: TableInlineGeometrySource;
 }
 export interface TableColumnWindowResult {
   segments: ReadonlyArray<TableColumnSegment>;
   /** True while at least one column is not mounted. */
   isWindowed: boolean;
+  /** True while column windowing is admitted, so focus is tracked. */
+  isActive: boolean;
+  onFocus: (event: FocusEvent<HTMLTableElement>) => void;
+  /** Releases the focused column only when focus leaves the table. */
+  onBlur: (event: FocusEvent<HTMLTableElement>) => void;
+}
+
+interface InlinePending {
+  snapshot: TableInlineGeometry;
+  to: number;
+}
+interface InlineTracking {
+  source: TableInlineGeometrySource;
+  snapshot: TableInlineGeometry;
+  runKeys: ReadonlyArray<string>;
+  offsets: ReadonlyArray<number>;
+  firstVisibleIndex: number;
+  /** The scrolled part of the first visible column, as a fraction of it. */
+  fraction: number;
+  pending: InlinePending | undefined;
 }
 
 const OVERSCAN = 2;
@@ -124,13 +163,51 @@ function getColumnViolation(table: HTMLTableElement): string | undefined {
   return undefined;
 }
 
+/**
+ * The cell that holds `target`, and its full-table column index. A windowed
+ * cell carries its position; an unwindowed row has no spacers, so there the
+ * cell index is the column index.
+ */
+function getFocusedCell(
+  table: HTMLTableElement,
+  target: EventTarget,
+): {cell: HTMLTableCellElement; index: number} | undefined {
+  const view = table.ownerDocument.defaultView;
+  if (view == null || !(target instanceof view.Element)) {
+    return undefined;
+  }
+  const cell = target.closest('td, th');
+  if (
+    !(cell instanceof view.HTMLTableCellElement) ||
+    !table.contains(cell) ||
+    cell.getAttribute('aria-hidden') === 'true'
+  ) {
+    return undefined;
+  }
+  const position = cell.getAttribute('aria-colindex');
+  return {
+    cell,
+    index: position == null ? cell.cellIndex : Number(position) - 1,
+  };
+}
+
+/** Right-to-left viewports report a negative physical inline offset. */
+function writeInlineScroll(viewport: HTMLDivElement, logical: number): void {
+  const isReversed =
+    viewport.ownerDocument.defaultView?.getComputedStyle(viewport).direction ===
+    'rtl';
+  viewport.scrollLeft = isReversed ? -logical : logical;
+}
+
 export function useTableColumnWindow({
   config,
   isAdmitted,
   widths,
   startCount,
   endCount,
+  columnKeys,
   table,
+  viewport,
   geometry,
 }: UseTableColumnWindowOptions): TableColumnWindowResult {
   const columnCount = widths.length;
@@ -153,12 +230,19 @@ export function useTableColumnWindow({
     config !== undefined &&
     isPositiveFinite(config.initialViewportWidth) &&
     runEnd > runStart &&
+    columnKeys.length === columnCount &&
     widths.every(width => Number.isFinite(width) && width >= 0);
   const snapshot = useSyncExternalStore(
     canWindow ? geometry.subscribeInline : subscribeToNothing,
     canWindow ? geometry.getSnapshot : getUnmeasured,
     canWindow ? geometry.getServerSnapshot : getUnmeasured,
   );
+  const [focusedKey, setFocusedKey] = useState<string | undefined>();
+  const [tracking, setTracking] = useState<InlineTracking | undefined>();
+  const focusNoteRef = useRef<FocusWithin | null>(null);
+  // Focus return reads the last input, so only a windowing table tracks it.
+  useInteractionModalityTrackingFor(viewport, canWindow);
+
   // Prefix offsets of the windowed run, and the pinned run sizes.
   const layout = useMemo(() => {
     const offsets = [0];
@@ -175,6 +259,22 @@ export function useTableColumnWindow({
     }
     return {offsets, pinnedStart, pinnedEnd};
   }, [widths, runStart, runEnd, columnCount]);
+  // Key work runs when the columns change, never on a scroll.
+  const runKeys = useMemo(
+    () => columnKeys.slice(runStart, runEnd),
+    [columnKeys, runStart, runEnd],
+  );
+  const runKeyIndices = useMemo(
+    () => new Map(runKeys.map((key, index) => [key, index])),
+    [runKeys],
+  );
+  const isFocusedKeyRemoved =
+    focusedKey !== undefined && !columnKeys.includes(focusedKey);
+  if (isFocusedKeyRemoved) {
+    setFocusedKey(undefined);
+  }
+  const focusRunIndex =
+    focusedKey === undefined ? undefined : runKeyIndices.get(focusedKey);
 
   const isMeasured =
     snapshot.isMeasured &&
@@ -188,20 +288,81 @@ export function useTableColumnWindow({
       : (config?.initialViewportWidth ?? 0)) -
     layout.pinnedStart -
     layout.pinnedEnd;
+  // Column order, width, visibility and pinning keep the first visible
+  // column's key and its fractional offset.
+  const last = tracking;
+  const anchorScroll =
+    canWindow &&
+    isMeasured &&
+    last !== undefined &&
+    (last.runKeys !== runKeys || last.offsets !== layout.offsets)
+      ? reconcileListAnchor({
+          previousKeys: last.runKeys,
+          keys: runKeys,
+          keyIndices: runKeyIndices,
+          firstVisibleIndex: last.firstVisibleIndex,
+          offset: last.fraction,
+          offsets: layout.offsets,
+          rowHeight: 0,
+          viewportHeight: viewportSize,
+          startOffset: 0,
+        })
+      : undefined;
+  const pending = tracking?.pending;
+  const isAwaitingAnchor =
+    tracking?.source === geometry &&
+    pending !== undefined &&
+    pending.snapshot.scrollLeft === snapshot.scrollLeft &&
+    (pending.to !== snapshot.scrollLeft || pending.snapshot === snapshot);
+  const pendingScroll =
+    anchorScroll ?? (isAwaitingAnchor ? pending.to : undefined);
   const range = canWindow
     ? calculateVariableListRange({
         offsets: layout.offsets,
         viewportSize,
-        scrollOffset: isMeasured ? (snapshot.scrollLeft ?? 0) : 0,
+        scrollOffset: isMeasured
+          ? (pendingScroll ?? snapshot.scrollLeft ?? 0)
+          : 0,
         isMeasured,
         overscan: OVERSCAN,
       })
     : undefined;
+  // The last window feeds the anchor, so it lives in state. Immutable inputs
+  // limit this update to one extra render.
+  if (range !== undefined && isMeasured) {
+    if (
+      tracking === undefined ||
+      tracking.source !== geometry ||
+      tracking.snapshot !== snapshot ||
+      tracking.runKeys !== runKeys ||
+      tracking.offsets !== layout.offsets
+    ) {
+      const firstWidth =
+        layout.offsets[range.firstVisibleIndex + 1] -
+        layout.offsets[range.firstVisibleIndex];
+      setTracking({
+        source: geometry,
+        snapshot,
+        runKeys,
+        offsets: layout.offsets,
+        firstVisibleIndex: range.firstVisibleIndex,
+        fraction: firstWidth > 0 ? range.offset / firstWidth : 0,
+        pending:
+          anchorScroll !== undefined
+            ? {snapshot, to: anchorScroll}
+            : isAwaitingAnchor
+              ? pending
+              : undefined,
+      });
+    }
+  } else if (tracking !== undefined && !canWindow) {
+    setTracking(undefined);
+  }
   const runCount = runEnd - runStart;
   const isWindowed =
     range !== undefined && (range.start > 0 || range.end < runCount);
-  const start = isWindowed ? runStart + range.start : 0;
-  const end = isWindowed ? runStart + range.end : columnCount;
+  const rangeStart = isWindowed ? range.start : 0;
+  const rangeEnd = isWindowed ? range.end : runCount;
 
   // A scroll inside the mounted range keeps the exact segment array.
   const segments = useMemo<TableColumnSegment[]>(() => {
@@ -210,34 +371,91 @@ export function useTableColumnWindow({
         ? []
         : [{type: 'columns', start: 0, end: columnCount}];
     }
-    const width = (from: number, to: number) =>
-      layout.offsets[to - runStart] - layout.offsets[from - runStart];
     const next: TableColumnSegment[] = [];
     if (runStart > 0) {
       next.push({type: 'columns', start: 0, end: runStart});
     }
-    if (start > runStart) {
-      next.push({
-        type: 'gap',
-        start: runStart,
-        end: start,
-        width: width(runStart, start),
-      });
-    }
-    next.push({type: 'columns', start, end});
-    if (end < runEnd) {
-      next.push({
-        type: 'gap',
-        start: end,
-        end: runEnd,
-        width: width(end, runEnd),
-      });
+    // At most three spacers: before the range, between the range and the
+    // focused column, and after both.
+    for (const segment of createListWindowSegments(
+      runCount,
+      1,
+      rangeStart,
+      rangeEnd,
+      focusRunIndex,
+    )) {
+      next.push(
+        segment.type === 'gap'
+          ? {
+              type: 'gap',
+              start: runStart + segment.start,
+              end: runStart + segment.end,
+              width:
+                layout.offsets[segment.end] - layout.offsets[segment.start],
+            }
+          : {
+              type: 'columns',
+              start: runStart + segment.start,
+              end: runStart + segment.end,
+            },
+      );
     }
     if (runEnd < columnCount) {
       next.push({type: 'columns', start: runEnd, end: columnCount});
     }
     return next;
-  }, [isWindowed, start, end, runStart, runEnd, columnCount, layout]);
+  }, [
+    isWindowed,
+    rangeStart,
+    rangeEnd,
+    focusRunIndex,
+    runStart,
+    runEnd,
+    runCount,
+    columnCount,
+    layout,
+  ]);
+
+  const onFocus = useCallback(
+    (event: FocusEvent<HTMLTableElement>) => {
+      const focused = getFocusedCell(event.currentTarget, event.target);
+      const key = focused === undefined ? undefined : columnKeys[focused.index];
+      if (focused === undefined || key === undefined) {
+        return;
+      }
+      focusNoteRef.current =
+        noteFocusWithin(focused.cell) ?? focusNoteRef.current;
+      setFocusedKey(key);
+    },
+    [columnKeys],
+  );
+  const onBlur = useCallback((event: FocusEvent<HTMLTableElement>) => {
+    const leavesDocument =
+      event.relatedTarget == null &&
+      !event.currentTarget.ownerDocument.hasFocus();
+    if (!leavesDocument && !event.currentTarget.contains(event.relatedTarget)) {
+      focusNoteRef.current = null;
+      setFocusedKey(undefined);
+    }
+  }, []);
+
+  useIsomorphicLayoutEffect(() => {
+    // Syncs DOM focus and the inline scroll position with the committed columns.
+    if (focusNoteRef.current != null && focusedKey === undefined) {
+      moveFocusLeftBehind(focusNoteRef.current, viewport.current, null, {
+        preventScroll: true,
+      });
+      focusNoteRef.current = null;
+    }
+    const node = viewport.current;
+    if (
+      pendingScroll !== undefined &&
+      node != null &&
+      Math.abs(Math.abs(node.scrollLeft) - pendingScroll) > 0.5
+    ) {
+      writeInlineScroll(node, pendingScroll);
+    }
+  });
 
   // Spanning cells come from plugin transforms, so they are known only after
   // they mount. Reads only mounted cells; one such cell renders every column.
@@ -252,5 +470,14 @@ export function useTableColumnWindow({
     }
   }, [isWindowed, segments, table, widths, config]);
 
-  return useMemo(() => ({segments, isWindowed}), [segments, isWindowed]);
+  return useMemo(
+    () => ({
+      segments,
+      isWindowed,
+      isActive: canWindow,
+      onFocus,
+      onBlur,
+    }),
+    [segments, isWindowed, canWindow, onFocus, onBlur],
+  );
 }
