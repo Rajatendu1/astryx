@@ -111,8 +111,13 @@ interface ValidationState {
 interface Violation {
   data: unknown[];
   keys: (string | number)[];
+  /** The declared config, so a measured pitch change keeps the fallback. */
   config: Readonly<UseTableRowsVirtualizationConfig>;
   reason: string;
+}
+interface MeasuredPitch {
+  declared: Readonly<UseTableRowsVirtualizationConfig>;
+  rowHeight: number;
 }
 const EMPTY_GEOMETRY: TableWindowGeometry = Object.freeze({
   viewportHeight: 0,
@@ -121,6 +126,10 @@ const EMPTY_GEOMETRY: TableWindowGeometry = Object.freeze({
   isMeasured: false,
 });
 const EMPTY_LOGICAL_POSITION_COLUMNS: ReadonlySet<number> = new Set();
+
+function roundPixels(value: number): number {
+  return Math.round(value * 100) / 100;
+}
 const EMPTY_POSITION_WIDTHS: ReadonlyMap<number, number> = new Map();
 
 function areWidthsEqual(
@@ -261,12 +270,67 @@ function hasClippedRowNumber(cell: HTMLTableCellElement): boolean {
   return false;
 }
 
+/** Rows within this distance of each other, or of the pitch, share one pitch. */
+const PITCH_TOLERANCE = 0.75;
+
+type GeometryCheck = {reason: string} | {pitch: number} | undefined;
+
+function getContentViolation(
+  row: HTMLTableRowElement,
+  logicalPositionColumns: ReadonlySet<number>,
+): string | undefined {
+  for (const [columnIndex, cell] of Array.from(row.cells).entries()) {
+    if (logicalPositionColumns.has(columnIndex) && hasClippedRowNumber(cell)) {
+      return 'Mounted row-number content exceeds the column width.';
+    }
+    if (cell.clientHeight > 0 && cell.scrollHeight > cell.clientHeight + 1) {
+      return 'Mounted cell content exceeds the declared fixed height.';
+    }
+  }
+  return undefined;
+}
+
+/**
+ * The pitch every mounted row shares after a text-size, zoom or theme change,
+ * or why the rows cannot share one. Reads every mounted row once.
+ */
+function measureSharedPitch(
+  rows: HTMLTableRowElement[],
+  logicalPositionColumns: ReadonlySet<number>,
+): GeometryCheck {
+  let min = Number.POSITIVE_INFINITY;
+  let max = 0;
+  let sum = 0;
+  let count = 0;
+  for (const row of rows) {
+    const height = row.getBoundingClientRect().height;
+    if (!(height > 0)) {
+      continue;
+    }
+    const reason = getContentViolation(row, logicalPositionColumns);
+    if (reason) {
+      return {reason};
+    }
+    min = Math.min(min, height);
+    max = Math.max(max, height);
+    sum += height;
+    count++;
+  }
+  if (count === 0) {
+    return undefined;
+  }
+  if (max - min > PITCH_TOLERANCE) {
+    return {reason: 'Mounted rows have different heights.'};
+  }
+  return {pitch: sum / count};
+}
+
 /**
  * Diagnostics inspect only mounted native rows/cells; all observers belong to Table.
- * Rows in `checkedRows` passed since the last layout invalidation, so only
- * newly mounted rows are read.
+ * Rows in `checkedRows` passed since the last layout invalidation, so a
+ * content change reads only newly mounted rows, until one leaves the pitch.
  */
-function getGeometryViolation(
+function getGeometryCheck(
   body: HTMLTableSectionElement,
   viewport: HTMLDivElement,
   table: HTMLTableElement,
@@ -275,7 +339,7 @@ function getGeometryViolation(
   logicalPositionColumns: ReadonlySet<number>,
   checkedRows: WeakSet<HTMLTableRowElement>,
   checkExtent: boolean,
-): string | undefined {
+): GeometryCheck {
   if (
     !body.isConnected ||
     !viewport.isConnected ||
@@ -286,7 +350,41 @@ function getGeometryViolation(
   ) {
     return undefined;
   }
-  if (checkExtent) {
+  const rows = Array.from(body.rows).filter(
+    row => row.getAttribute('aria-hidden') !== 'true',
+  );
+  let shouldCheckExtent = checkExtent;
+  for (const row of rows) {
+    if (checkedRows.has(row)) {
+      continue;
+    }
+    const height = row.getBoundingClientRect().height;
+    // A row that left the pitch: if every mounted row moved together, as after
+    // a text-size, zoom or theme change, their height becomes the pitch.
+    if (height > 0 && Math.abs(height - rowHeight) > PITCH_TOLERANCE) {
+      const shared = measureSharedPitch(rows, logicalPositionColumns);
+      if (
+        shared === undefined ||
+        'reason' in shared ||
+        Math.abs(shared.pitch - rowHeight) > PITCH_TOLERANCE
+      ) {
+        return shared;
+      }
+      // The rows still share this pitch and their content fits, so only the
+      // extent can show the difference.
+      for (const mounted of rows) {
+        checkedRows.add(mounted);
+      }
+      shouldCheckExtent = true;
+      break;
+    }
+    const reason = getContentViolation(row, logicalPositionColumns);
+    if (reason) {
+      return {reason};
+    }
+    checkedRows.add(row);
+  }
+  if (shouldCheckExtent) {
     const bodyHeight = body.getBoundingClientRect().height;
     if (!isPositiveFinite(bodyHeight)) {
       return undefined;
@@ -295,29 +393,11 @@ function getGeometryViolation(
       Math.abs(bodyHeight - totalHeight) > 1 ||
       (viewport.scrollHeight > 0 && totalHeight > viewport.scrollHeight + 1)
     ) {
-      return 'The browser cannot represent the declared body extent or fixed row pitch.';
+      return {
+        reason:
+          'The browser cannot represent the declared body extent or fixed row pitch.',
+      };
     }
-  }
-  for (const row of Array.from(body.rows)) {
-    if (row.getAttribute('aria-hidden') === 'true' || checkedRows.has(row)) {
-      continue;
-    }
-    const height = row.getBoundingClientRect().height;
-    if (height > 0 && Math.abs(height - rowHeight) > 0.75) {
-      return 'Mounted row pitch does not match rowHeight.';
-    }
-    for (const [columnIndex, cell] of Array.from(row.cells).entries()) {
-      if (
-        logicalPositionColumns.has(columnIndex) &&
-        hasClippedRowNumber(cell)
-      ) {
-        return 'Mounted row-number content exceeds the column width.';
-      }
-      if (cell.clientHeight > 0 && cell.scrollHeight > cell.clientHeight + 1) {
-        return 'Mounted cell content exceeds the declared fixed height.';
-      }
-    }
-    checkedRows.add(row);
   }
   return undefined;
 }
@@ -338,13 +418,23 @@ export function useTableWindow<T>({
   geometry,
 }: UseTableWindowOptions<T>): TableWindowResult {
   const [violation, setViolation] = useState<Violation | undefined>();
-  const config = getTableVirtualizationConfig(capability);
+  const declared = getTableVirtualizationConfig(capability);
+  // The pitch every mounted row shares when it differs from rowHeight, as
+  // after a text-size, zoom or theme change. A new capability drops it.
+  const [measuredPitch, setMeasuredPitch] = useState<MeasuredPitch>();
+  const config = useMemo(
+    () =>
+      declared !== undefined && measuredPitch?.declared === declared
+        ? Object.freeze({...declared, rowHeight: measuredPitch.rowHeight})
+        : declared,
+    [declared, measuredPitch],
+  );
   const hasValidConfig =
-    config !== undefined &&
+    declared !== undefined &&
     calculateListWindow({
       rowCount: data.length,
-      rowHeight: config.rowHeight,
-      viewportHeight: config.initialViewportHeight,
+      rowHeight: declared.rowHeight,
+      viewportHeight: declared.initialViewportHeight,
       scrollTop: 0,
       startOffset: 0,
       isMeasured: false,
@@ -352,7 +442,7 @@ export function useTableWindow<T>({
   const isRejected =
     violation?.data === data &&
     violation.keys === keys &&
-    violation.config === config;
+    violation.config === declared;
   const canWindow =
     isAdmitted &&
     hasValidConfig &&
@@ -373,6 +463,11 @@ export function useTableWindow<T>({
     'Table',
     `${violation?.reason} Rendering all rows without fixed constraints.`,
     isRejected,
+  );
+  useDevWarningPerMessage(
+    'Table',
+    `Rows measure ${roundPixels(config?.rowHeight ?? 0)}px, not rowHeight ${roundPixels(declared?.rowHeight ?? 0)}px. Windowing uses the measured height.`,
+    config !== declared,
   );
   // Focus return reads the last input, so only a windowed table tracks it.
   useInteractionModalityTrackingFor(viewport, canWindow);
@@ -626,7 +721,7 @@ export function useTableWindow<T>({
     const checkExtent = isLayoutChanged || state.totalHeight !== totalHeight;
     state.layoutRevision = layoutRevision;
     state.totalHeight = totalHeight;
-    const reason = getGeometryViolation(
+    const check = getGeometryCheck(
       body.current,
       viewport.current,
       table.current,
@@ -636,12 +731,23 @@ export function useTableWindow<T>({
       state.checkedRows,
       checkExtent,
     );
-    if (reason) {
-      setViolation({data, keys, config, reason});
+    if (check === undefined || declared === undefined) {
+      return;
+    }
+    if ('pitch' in check) {
+      // The rows share a new height, so windowing continues at it.
+      setMeasuredPitch(
+        Math.abs(check.pitch - declared.rowHeight) <= PITCH_TOLERANCE
+          ? undefined
+          : {declared, rowHeight: check.pitch},
+      );
+    } else {
+      setViolation({data, keys, config: declared, reason: check.reason});
     }
   }, [
     isWindowed,
     config,
+    declared,
     data,
     keys,
     logicalPositionColumns,
