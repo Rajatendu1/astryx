@@ -2971,6 +2971,7 @@ hook useTabListContext: () => TabListContextValue
 hook useTableColumnResize: <T extends Record<string, unknown>>(config: UseTableColumnResizeConfig) => TablePlugin<T>
 hook useTableColumnSettings: <T extends Record<string, unknown>, TColumnKey extends string = string>(config: UseTableColumnSettingsConfig<TColumnKey>) => TablePlugin<T>
 hook useTableColumnSettingsState: <TColumnKey extends string = string>(config: UseTableColumnSettingsStateConfig<TColumnKey>) => UseTableColumnSettingsStateReturn<TColumnKey>
+hook useTableColumnsVirtualization: ({…}: UseTableColumnsVirtualizationConfig) => TableVirtualizationCapability
 hook useTableFilterState: (initialState?: TableFilterState) => UseTableFilterStateResult
 hook useTableFiltering: <T extends Record<string, unknown>>(config: UseTableFilteringConfig) => TablePlugin<T>
 hook useTableGroupedRows: <T extends Record<string, unknown>>(config: UseTableGroupedRowsConfig<T>) => UseTableGroupedRowsResult<T>
@@ -3639,7 +3640,7 @@ interface BaseTableProps<T extends Record<string, unknown>> extends BaseProps<HT
   rowIndexStart?: number = 1
   scrollWrapper?: ComponentType<{ children: ReactNode; htmlProps?: HTMLAttributes<HTMLDivElement> & { ref?: Ref<HTMLDivElement> }; xstyle?: StyleXStyles[]; beforeTable?: ReactNode; afterTable?: ReactNode }>
   textOverflow?: 'wrap' | 'truncate' = 'wrap'
-  virtualization?: TableVirtualizationCapability
+  virtualization?: TableVirtualizationCapability | ReadonlyArray<TableVirtualizationCapability>
   xstyle?: StyleXStyles
   inherits AriaAttributes, DOMAttributes, HTMLAttributes
 interface BaseTypeaheadDialogMenuInfo
@@ -6234,6 +6235,8 @@ interface UseTableColumnSettingsStateReturn<TColumnKey extends string = string>
   setActiveColumnKeys: (keys: string[]) => void
   showAllColumns: () => void
   toggleColumn: (key: TColumnKey) => void
+interface UseTableColumnsVirtualizationConfig
+  initialViewportWidth: number
 interface UseTableFilteringConfig
   filters: TableFilterState
   onFilterChange: (columnKey: string, value: TableFilterValue | null) => void
@@ -8787,6 +8790,7 @@ UseTableColumnResizeConfig (.)
 UseTableColumnSettingsConfig (.)
 UseTableColumnSettingsStateConfig (.)
 UseTableColumnSettingsStateReturn (.)
+UseTableColumnsVirtualizationConfig (.)
 UseTableFilteringConfig (.)
 UseTableGroupedRowsConfig (.)
 UseTableGroupedRowsResult (.)
@@ -8816,6 +8820,7 @@ useBaseTablePlugins (.)
 useTableColumnResize (.)
 useTableColumnSettings (.)
 useTableColumnSettingsState (.)
+useTableColumnsVirtualization (.)
 useTableFilterState (.)
 useTableFiltering (.)
 useTableGroupedRows (.)
